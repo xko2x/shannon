@@ -7,6 +7,9 @@
 // Production Claude agent execution with retry, git checkpoints, and audit logging
 
 import { type JsonSchemaOutputFormat, query } from '@anthropic-ai/claude-agent-sdk';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { fs, path } from 'zx';
 import type { AuditSession } from '../audit/index.js';
 import { deliverablesDir } from '../paths.js';
@@ -46,6 +49,190 @@ function outputLines(lines: string[]): void {
   for (const line of lines) {
     console.log(line);
   }
+}
+
+const CODEX_ADAPTER_PROMPT = `
+Execution adapter:
+- You are running under Codex CLI, not Claude Code.
+- If the task names Claude-specific tools such as Task Agent, TodoWrite, Read, Write, Edit, or Bash, translate those instructions to the tools available here.
+- Use shell commands such as rg, sed, nl, curl, php, node, and python for reading, testing, and scripting.
+- If a task asks for Task Agent or TodoWrite, perform the work directly and keep the plan internally; do not fail because those tool names are unavailable.
+- Use the save-deliverable CLI for required Shannon deliverables.
+- If a JSON schema is enforced, make your final response valid JSON matching that schema only.
+`.trim();
+
+function normalizeSchemaForCodex(schema: unknown): unknown {
+  if (Array.isArray(schema)) {
+    return schema.map((entry) => normalizeSchemaForCodex(entry));
+  }
+
+  if (!schema || typeof schema !== 'object') {
+    return schema;
+  }
+
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+    normalized[key] = normalizeSchemaForCodex(value);
+  }
+
+  if (normalized.properties && typeof normalized.properties === 'object' && !Array.isArray(normalized.properties)) {
+    normalized.additionalProperties = false;
+    normalized.required = Object.keys(normalized.properties as Record<string, unknown>);
+  }
+
+  if (normalized.type === 'object' && normalized.additionalProperties === undefined) {
+    normalized.additionalProperties = false;
+  }
+
+  return normalized;
+}
+
+async function ensureCodexHelperBin(shannonRoot: string): Promise<string> {
+  const binDir = path.join(shannonRoot, '.shannon-codex-bin');
+  await fs.ensureDir(binDir);
+
+  const saveDeliverablePath = path.join(binDir, 'save-deliverable');
+  const saveDeliverableTarget = path.join(shannonRoot, 'apps/worker/dist/scripts/save-deliverable.js');
+  await fs.writeFile(
+    saveDeliverablePath,
+    `#!/usr/bin/env bash\nexec node ${JSON.stringify(saveDeliverableTarget)} "$@"\n`,
+    'utf8',
+  );
+  await fs.chmod(saveDeliverablePath, 0o755);
+
+  const generateTotpPath = path.join(binDir, 'generate-totp');
+  const generateTotpTarget = path.join(shannonRoot, 'apps/worker/dist/scripts/generate-totp.js');
+  if (await fs.pathExists(generateTotpTarget)) {
+    await fs.writeFile(generateTotpPath, `#!/usr/bin/env bash\nexec node ${JSON.stringify(generateTotpTarget)} "$@"\n`, 'utf8');
+    await fs.chmod(generateTotpPath, 0o755);
+  }
+
+  return binDir;
+}
+
+async function runCodexPrompt(
+  fullPrompt: string,
+  sourceDir: string,
+  description: string,
+  logger: ActivityLogger,
+  modelTier: ModelTier,
+  outputFormat?: JsonSchemaOutputFormat,
+  deliverablesSubdir?: string,
+): Promise<ClaudePromptResult> {
+  const timer = new Timer(`codex-agent-${description.toLowerCase().replace(/\s+/g, '-')}`);
+  const tempDir = path.join(tmpdir(), `shannon-codex-${randomUUID()}`);
+  await fs.ensureDir(tempDir);
+
+  const outputPath = path.join(tempDir, 'last-message.txt');
+  const schemaPath = path.join(tempDir, 'output-schema.json');
+  if (outputFormat) {
+    await fs.writeFile(schemaPath, JSON.stringify(normalizeSchemaForCodex(outputFormat.schema), null, 2), 'utf8');
+  }
+
+  const shannonRoot = process.cwd();
+  const helperBin = await ensureCodexHelperBin(shannonRoot);
+  const codexBin = process.env.SHANNON_CODEX_BIN || 'codex';
+  const codexModel = process.env.SHANNON_CODEX_MODEL || process.env.CODEX_MODEL;
+  const modelName = codexModel || `codex-cli-${modelTier}`;
+
+  const args = [
+    'exec',
+    '--dangerously-bypass-approvals-and-sandbox',
+    '-s',
+    'danger-full-access',
+    '--skip-git-repo-check',
+    '-C',
+    sourceDir,
+    '-o',
+    outputPath,
+  ];
+
+  if (codexModel) {
+    args.push('-m', codexModel);
+  }
+
+  if (outputFormat) {
+    args.push('--output-schema', schemaPath);
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${helperBin}:${process.env.PATH ?? ''}`,
+    PLAYWRIGHT_MCP_OUTPUT_DIR: deliverablesSubdir
+      ? path.join(sourceDir, path.dirname(deliverablesSubdir), '.playwright-cli')
+      : path.join(sourceDir, '.shannon', '.playwright-cli'),
+    ...(deliverablesSubdir && { SHANNON_DELIVERABLES_SUBDIR: deliverablesSubdir }),
+  };
+
+  const prompt = `${CODEX_ADAPTER_PROMPT}\n\n${fullPrompt}`;
+  logger.info(`Running Codex CLI: ${description}...`);
+  logger.info(`Codex options: cwd=${sourceDir}, model=${modelName}, schema=${outputFormat ? 'yes' : 'no'}`);
+
+  const child = spawn(codexBin, args, {
+    cwd: sourceDir,
+    env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    const text = chunk.toString();
+    stdout += text;
+    process.stdout.write(text);
+  });
+
+  child.stderr.on('data', (chunk: Buffer) => {
+    const text = chunk.toString();
+    stderr += text;
+    process.stderr.write(text);
+  });
+
+  child.stdin.end(prompt);
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', resolve);
+  });
+
+  const duration = timer.stop();
+  const outputText = (await fs.readFile(outputPath, 'utf8').catch(() => stdout)).trim();
+
+  let structuredOutput: unknown | undefined;
+  if (outputFormat && outputText) {
+    try {
+      structuredOutput = JSON.parse(outputText);
+    } catch (error) {
+      logger.warn(`Codex output did not parse as structured JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (exitCode !== 0) {
+    const msg = stderr.trim() || stdout.trim() || `codex exited with status ${exitCode}`;
+    return {
+      result: outputText || null,
+      success: false,
+      duration,
+      turns: 1,
+      cost: 0,
+      model: modelName,
+      error: msg.slice(0, 4000),
+      errorType: 'CodexExecutionError',
+      retryable: true,
+    };
+  }
+
+  return {
+    result: outputText || null,
+    success: true,
+    duration,
+    turns: 1,
+    cost: 0,
+    model: modelName,
+    partialCost: 0,
+    ...(structuredOutput !== undefined && { structuredOutput }),
+  };
 }
 
 async function writeErrorLog(
@@ -212,6 +399,10 @@ export async function runClaudePrompt(
     if (val) {
       sdkEnv[name] = val;
     }
+  }
+
+  if (process.env.SHANNON_AGENT_EXECUTOR === 'codex') {
+    return runCodexPrompt(fullPrompt, sourceDir, description, logger, modelTier, outputFormat, deliverablesSubdir);
   }
 
   // 4. Configure SDK options

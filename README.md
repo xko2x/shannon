@@ -118,6 +118,7 @@ Shannon Pro supports a self-hosted runner model (similar to GitHub Actions self-
   - [AWS Bedrock](#aws-bedrock)
   - [Google Vertex AI](#google-vertex-ai)
   - [Custom Base URL](#custom-base-url)
+  - [Experimental Codex CLI Executor](#experimental-codex-cli-executor)
   - [Platform-Specific Instructions](#platform-specific-instructions)
   - [Output and Results](#output-and-results)
 - [Sample Reports](#sample-reports)
@@ -546,6 +547,50 @@ ANTHROPIC_LARGE_MODEL=claude-opus-4-6
 ```
 
 </details>
+
+### Experimental Codex CLI Executor
+
+Shannon can be run with the local OpenAI Codex CLI as an experimental executor for development and local white-box testing. This mode reuses the Codex CLI authentication/session already present on the host and bypasses Shannon's normal Anthropic SDK credential preflight.
+
+> [!WARNING]
+> This mode is experimental and is not the default supported path. Shannon's prompts and evaluation harness are still optimized for Claude Code. Codex mode includes a compatibility adapter for Claude-specific tool names, but results may differ and should be manually reviewed.
+
+Requirements:
+
+- Run from a local Shannon clone after `pnpm install && pnpm build`.
+- Install and authenticate the OpenAI Codex CLI on the host.
+- Run the worker directly on the host. The standard `./shannon start` Docker worker path does not automatically include the host Codex CLI or its session.
+- Keep the target web application running and pass both the live URL and the repository path.
+
+Start Temporal once:
+
+```bash
+docker compose up -d
+```
+
+Run a Codex-backed scan from the Shannon repository root:
+
+```bash
+export SHANNON_AGENT_EXECUTOR=codex
+export SHANNON_DISABLE_LOADER=true
+export TEMPORAL_ADDRESS=localhost:7233
+
+node apps/worker/dist/temporal/worker.js \
+  http://127.0.0.1:3000 \
+  /path/to/your/repo \
+  --task-queue shannon-codex-local \
+  --workspace shannon-codex-local \
+  --config /path/to/config.yaml
+```
+
+Optional environment variables:
+
+```bash
+export SHANNON_CODEX_BIN=codex          # default: codex
+export SHANNON_CODEX_MODEL=gpt-5.5      # optional model override
+```
+
+Codex mode also normalizes Shannon's structured-output JSON schemas for OpenAI's stricter schema validation and places helper wrappers such as `save-deliverable` on the agent `PATH` at runtime. The generated helper directory is `.shannon-codex-bin/` and is ignored by git.
 
 ### Platform-Specific Instructions
 

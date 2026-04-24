@@ -19,9 +19,11 @@
  */
 
 import { lookup } from 'node:dns/promises';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
+import { promisify } from 'node:util';
 import type { SDKAssistantMessageError } from '@anthropic-ai/claude-agent-sdk';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { resolveModel } from '../ai/models.js';
@@ -32,6 +34,7 @@ import { err, ok, type Result } from '../types/result.js';
 import { isRetryableError, PentestError } from './error-handling.js';
 
 const TARGET_URL_TIMEOUT_MS = 10_000;
+const execFileAsync = promisify(execFile);
 
 function isLoopbackAddress(address: string): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '0.0.0.0';
@@ -197,6 +200,28 @@ async function validateCredentials(logger: ActivityLogger, apiKey?: string, prov
   if (apiKey) {
     process.env.ANTHROPIC_API_KEY = apiKey;
   }
+
+  if (process.env.SHANNON_AGENT_EXECUTOR === 'codex') {
+    const codexBin = process.env.SHANNON_CODEX_BIN || 'codex';
+    logger.info(`Codex executor selected; validating CLI: ${codexBin}`);
+    try {
+      await execFileAsync(codexBin, ['exec', '--help'], { timeout: 10_000 });
+      logger.info('Codex CLI OK');
+      return ok(undefined);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return err(
+        new PentestError(
+          `Codex executor selected but Codex CLI is unavailable or broken: ${message}`,
+          'config',
+          false,
+          { codexBin },
+          ErrorCode.AUTH_FAILED,
+        ),
+      );
+    }
+  }
+
   // 1. Custom base URL — validate endpoint is reachable via SDK query
   if (process.env.ANTHROPIC_BASE_URL && process.env.ANTHROPIC_AUTH_TOKEN) {
     const baseUrl = process.env.ANTHROPIC_BASE_URL;
